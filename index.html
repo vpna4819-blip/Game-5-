@@ -7,11 +7,11 @@
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>WASM Engine Proxy</title>
+  <title>WASM Engine Proxy - Adaptive Performance</title>
 
   <style>
     body, html { margin: 0; padding: 0; width: 100vw; height: 100vh; background-color: #000; overflow: hidden; touch-action: none; }
-    canvas#canvas { width: 100%; height: 100%; display: block; }
+    canvas#canvas { width: 100%; height: 100%; display: block; image-rendering: pixelated; /* Keeps downscaled canvas sharp */ }
     
     /* Touch UI Overlay */
     #touch-ui { display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 9999; pointer-events: none; user-select: none; }
@@ -49,42 +49,109 @@
   </div>
 
   <script>
-    // 1. DEVICE DETECTION & HARDWARE CLAMPING
+    // ------------------------------------------------------------------
+    // 1. DEVICE TIER DETECTION & ADAPTIVE CONFIGURATION
+    // ------------------------------------------------------------------
     const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
     
+    // Default hardware values if API is restricted
+    const ram = navigator.deviceMemory || 4; 
+    const cores = navigator.hardwareConcurrency || 4;
+    
+    // Determine Hardware Tier
+    const isLowEnd = isMobile && (ram <= 4 || cores <= 4);
+    
+    // Set dynamic baseline constraints
+    let currentScale = isMobile ? (isLowEnd ? 0.5 : 0.7) : 1.0;
+    const targetFPS = isMobile ? (isLowEnd ? 30 : 60) : 60;
+
+    // Apply strict worker clamp for mobile
     if (isMobile) {
-      // Prevent spawning too many Web Workers on mobile devices (prevents OOM / Thermal Throttle)
-      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 2 });
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => Math.min(cores, 2) });
     }
 
-    // 2. ENGINE CONFIGURATION (Emscripten / Unity standard hook)
+    // ------------------------------------------------------------------
+    // 2. WEBGL INTERCEPTOR (Forced Optimizations)
+    // ------------------------------------------------------------------
+    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function(type, options) {
+      if (options === undefined) options = {};
+      
+      if (type === 'webgl' || type === 'webgl2') {
+        // Universal high-performance overrides
+        options.powerPreference = 'high-performance';
+        options.desynchronized = true;
+        options.antialias = false; 
+        
+        // Aggressive low-end overrides
+        if (isLowEnd) {
+          options.alpha = false;
+          options.depth = false; // Disables depth-precision buffer per requirements
+          options.stencil = false;
+        }
+      }
+      return originalGetContext.call(this, type, options);
+    };
+
+    // ------------------------------------------------------------------
+    // 3. ENGINE CONFIGURATION (Emscripten / WebAssembly hooks)
+    // ------------------------------------------------------------------
     window.Module = {
       canvas: document.getElementById('canvas'),
       arguments: isMobile ? [
-        '-lowMemory=true',       // Custom flag for upstream engine
-        '-shadowQuality=-1',     // Disable shadows
-        '-frameLimit=2',         // Engine specific tick: cap to 30fps
-        '-lodScale=0.5'          // Reduce polygon draw distance
+        `-lowMemory=${isLowEnd ? 'true' : 'false'}`,
+        `-frameLimit=${targetFPS}`,
+        `-shadowQuality=${isLowEnd ? '-1' : '0'}`,
+        `-lodScale=${isLowEnd ? '0.5' : '0.8'}`
       ] : [],
       preRun: [function() {
         if (isMobile) {
-          // Downscale the physical WebGL back-buffer by 50% to save GPU fill-rate
-          const originalGetContext = HTMLCanvasElement.prototype.getContext;
-          HTMLCanvasElement.prototype.getContext = function(type, options) {
-            if (options && (type === 'webgl' || type === 'webgl2')) {
-              options.antialias = false; 
-              options.powerPreference = "low-power";
-            }
-            return originalGetContext.call(this, type, options);
-          };
-          
-          // Force internal canvas scale
-          window.devicePixelRatio = 0.5;
+          // Set initial hardware-based canvas resolution scale
+          window.devicePixelRatio = currentScale;
         }
       }]
     };
 
-    // 3. MOBILE TOUCH CONTROLS LOGIC
+    // ------------------------------------------------------------------
+    // 4. DYNAMIC FPS THROTTLER (Frame Dropping Protection)
+    // ------------------------------------------------------------------
+    if (isMobile) {
+      let frameCount = 0;
+      let lastCheckTime = performance.now();
+      const checkIntervalMs = 3000; // 3 seconds
+      
+      function monitorDynamicPerformance() {
+        frameCount++;
+        const now = performance.now();
+        const elapsed = now - lastCheckTime;
+        
+        if (elapsed >= checkIntervalMs) {
+          const avgFps = (frameCount / elapsed) * 1000;
+          
+          // If lagging heavily over 3 seconds, drop resolution by 10%
+          if (avgFps < 24 && currentScale > 0.2) {
+            currentScale = Math.max(currentScale * 0.90, 0.2); // Don't scale below 20%
+            
+            // Apply new scale and trigger engine window resize
+            window.devicePixelRatio = currentScale;
+            window.dispatchEvent(new Event('resize'));
+            
+            console.warn(`[Auto-Optimization] Thermal throttle/Lag detected. FPS: ${avgFps.toFixed(1)}. Downscaling canvas by 10%. New Scale: ${currentScale.toFixed(2)}x`);
+          }
+          
+          frameCount = 0;
+          lastCheckTime = now;
+        }
+        requestAnimationFrame(monitorDynamicPerformance);
+      }
+      
+      // Start the performance loop
+      requestAnimationFrame(monitorDynamicPerformance);
+    }
+
+    // ------------------------------------------------------------------
+    // 5. MOBILE TOUCH CONTROLS LOGIC
+    // ------------------------------------------------------------------
     if (isMobile) {
       document.getElementById('touch-ui').style.display = 'block';
 
