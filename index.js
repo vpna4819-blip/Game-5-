@@ -1,48 +1,28 @@
 /**
- * Cloudflare Worker: WebAssembly Game Edge Proxy & Permanent Archiver
- * Bindings Required: 
- * - R2 Bucket bound to `GAME_STORAGE`
+ * Cloudflare Worker: WebAssembly Game Edge Proxy & Cache API
+ * FREE TIER - No R2 Storage Required
  */
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const originHost = 'gta.deloskiyt.pl';
-    const originUrl = `https://${originHost}`;
+    const isGet = request.method === 'GET';
     
-    // Normalize root path to index.html for R2 storage key consistency
-    let key = url.pathname;
-    if (key === '/') key = '/index.html';
+    // The Cache API requires a Request object as the key
+    const cache = caches.default;
+    const cacheKey = new Request(url.toString(), request);
 
-    // Mandatory SharedArrayBuffer isolation & CORS headers
-    const securityHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp',
-    };
-
-    // Infinite cache headers for R2 mirrored assets
-    const immutableCacheHeaders = {
-      ...securityHeaders,
-      'Cache-Control': 'public, max-age=31536000, immutable'
-    };
-
-    // 1. LAZY MIRRORING - Check R2 Storage First
-    if (request.method === 'GET') {
-      try {
-        const cachedObject = await env.GAME_STORAGE.get(key);
-        if (cachedObject) {
-          const headers = new Headers(immutableCacheHeaders);
-          cachedObject.writeHttpMetadata(headers);
-          return new Response(cachedObject.body, { headers });
-        }
-      } catch (error) {
-        // If R2 errors (e.g., bucket down), fail silently and fallback to origin
-        console.error("R2 Read Error:", error);
+    // 1. CACHE FIRST: Check Cloudflare's free Edge Cache
+    if (isGet) {
+      const cachedResponse = await cache.match(cacheKey);
+      if (cachedResponse) {
+        // Return immediately if found (already contains COOP/COEP headers)
+        return cachedResponse;
       }
     }
 
-    // 2. CACHE MISS - Fetch from Upstream Origin Server
+    // 2. CACHE MISS: Fetch from Upstream Origin Server
     const targetUrl = new URL(request.url);
     targetUrl.hostname = originHost;
     targetUrl.protocol = 'https:';
@@ -60,25 +40,12 @@ export default {
       return new Response("Origin Server Offline", { status: 502 });
     }
 
-    // 3. ASYNC ARCHIVING - Store permanently in R2
-    if (request.method === 'GET' && response.status === 200) {
-      // Clone response immediately because body can only be read once
-      const responseClone = response.clone();
-      const contentType = response.headers.get('Content-Type') || 'application/octet-stream';
-
-      // Non-blocking async archival to prevent delaying the user's response
-      ctx.waitUntil(
-        env.GAME_STORAGE.put(key, responseClone.body, {
-          httpMetadata: { contentType }
-        }).catch(err => console.error("R2 Write Error:", err))
-      );
-    }
-
-    // 4. HTML INJECTION & REWRITING
+    // 3. HTML INJECTION & REWRITING
     const isHtml = response.headers.get('Content-Type')?.includes('text/html');
+    let modifiedResponse = response;
+
     if (isHtml) {
       const rewriter = new HTMLRewriter()
-        // Rewrite asset paths pointing directly to the origin
         .on('[src]', {
           element(e) {
             const src = e.getAttribute('src');
@@ -96,20 +63,41 @@ export default {
           }
         });
         
-      response = rewriter.transform(response);
+      modifiedResponse = rewriter.transform(modifiedResponse);
     }
 
-    // 5. ATTACH SECURITY HEADERS TO ORIGIN RESPONSE
-    const responseHeaders = new Headers(response.headers);
-    Object.entries(securityHeaders).forEach(([k, v]) => responseHeaders.set(k, v));
+    // 4. ATTACH SECURITY & CACHE HEADERS
+    const responseHeaders = new Headers(modifiedResponse.headers);
+    
+    // Mandatory SharedArrayBuffer isolation & CORS headers for WebAssembly
+    responseHeaders.set('Access-Control-Allow-Origin', '*');
+    responseHeaders.set('Cross-Origin-Opener-Policy', 'same-origin');
+    responseHeaders.set('Cross-Origin-Embedder-Policy', 'require-corp');
 
-    // Ensure downstream caches know this might be modified
-    responseHeaders.set('Cache-Control', 'public, max-age=0, must-revalidate');
+    // Set Cache-Control so the Cloudflare Cache API knows how long to store it
+    if (isGet && response.status === 200) {
+      if (isHtml) {
+        // HTML gets a shorter cache (1 hour) to allow for frontend updates
+        responseHeaders.set('Cache-Control', 'public, max-age=3600');
+      } else {
+        // Game assets (.wasm, .js, .data, textures) cached for 1 year
+        responseHeaders.set('Cache-Control', 'public, max-age=31536000, immutable');
+      }
+    }
 
-    return new Response(response.body, {
+    // Construct the final response to send to the user and the cache
+    const finalResponse = new Response(modifiedResponse.body, {
       status: response.status,
       statusText: response.statusText,
       headers: responseHeaders
     });
+
+    // 5. ASYNC CACHING: Store the successful response in the Edge Cache
+    if (isGet && response.status === 200) {
+      // ctx.waitUntil ensures caching finishes in the background without delaying the user
+      ctx.waitUntil(cache.put(cacheKey, finalResponse.clone()));
+    }
+
+    return finalResponse;
   }
 };
