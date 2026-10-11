@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!-- PWA & Mobile Viewport Constraints -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>WASM Engine Proxy</title>
+
+  <style>
+    body, html { margin: 0; padding: 0; width: 100vw; height: 100vh; background-color: #000; overflow: hidden; touch-action: none; }
+    canvas#canvas { width: 100%; height: 100%; display: block; }
+    
+    /* Touch UI Overlay */
+    #touch-ui { display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 9999; pointer-events: none; user-select: none; }
+    
+    /* Left: Movement Joystick */
+    #joystick-zone { position: absolute; bottom: 40px; left: 40px; width: 150px; height: 150px; background: rgba(255,255,255,0.1); border-radius: 50%; pointer-events: auto; }
+    #joystick-nub { position: absolute; top: 50%; left: 50%; width: 60px; height: 60px; background: rgba(255,255,255,0.4); border-radius: 50%; transform: translate(-50%, -50%); transition: transform 0.05s ease-out; }
+    
+    /* Right: Camera Swipe Area */
+    #camera-zone { position: absolute; top: 0; right: 0; width: 50%; height: 60%; pointer-events: auto; }
+    
+    /* Right: Action Buttons */
+    #action-buttons { position: absolute; bottom: 20px; right: 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 15px; pointer-events: auto; }
+    .action-btn { width: 65px; height: 65px; border-radius: 50%; background: rgba(255,255,255,0.2); border: 2px solid rgba(255,255,255,0.4); color: white; font-weight: bold; font-size: 12px; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
+    .action-btn:active { background: rgba(255,255,255,0.5); }
+    
+    /* PWA Fullscreen Toggle */
+    #fs-btn { position: absolute; top: 15px; right: 15px; padding: 10px 15px; background: rgba(0,0,0,0.5); color: #fff; border: 1px solid #fff; pointer-events: auto; z-index: 10000; border-radius: 8px; }
+  </style>
+</head>
+<body>
+
+  <button id="fs-btn" onclick="toggleFullScreen()">⛶ Fullscreen</button>
+  <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
+
+  <div id="touch-ui">
+    <div id="joystick-zone"><div id="joystick-nub"></div></div>
+    <div id="camera-zone"></div>
+    <div id="action-buttons">
+      <div class="action-btn" id="btn-jump">JUMP</div>
+      <div class="action-btn" id="btn-enter">ENTER</div>
+      <div class="action-btn" id="btn-sprint">RUN</div>
+      <div class="action-btn" id="btn-action">ACT</div>
+    </div>
+  </div>
+
+  <script>
+    // 1. DEVICE DETECTION & HARDWARE CLAMPING
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    
+    if (isMobile) {
+      // Prevent spawning too many Web Workers on mobile devices (prevents OOM / Thermal Throttle)
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 2 });
+    }
+
+    // 2. ENGINE CONFIGURATION (Emscripten / Unity standard hook)
+    window.Module = {
+      canvas: document.getElementById('canvas'),
+      arguments: isMobile ? [
+        '-lowMemory=true',       // Custom flag for upstream engine
+        '-shadowQuality=-1',     // Disable shadows
+        '-frameLimit=2',         // Engine specific tick: cap to 30fps
+        '-lodScale=0.5'          // Reduce polygon draw distance
+      ] : [],
+      preRun: [function() {
+        if (isMobile) {
+          // Downscale the physical WebGL back-buffer by 50% to save GPU fill-rate
+          const originalGetContext = HTMLCanvasElement.prototype.getContext;
+          HTMLCanvasElement.prototype.getContext = function(type, options) {
+            if (options && (type === 'webgl' || type === 'webgl2')) {
+              options.antialias = false; 
+              options.powerPreference = "low-power";
+            }
+            return originalGetContext.call(this, type, options);
+          };
+          
+          // Force internal canvas scale
+          window.devicePixelRatio = 0.5;
+        }
+      }]
+    };
+
+    // 3. MOBILE TOUCH CONTROLS LOGIC
+    if (isMobile) {
+      document.getElementById('touch-ui').style.display = 'block';
+
+      // Synthetic Event Dispatcher for WASM engines
+      function dispatchKey(type, code, key, keyCode) {
+        window.dispatchEvent(new KeyboardEvent(type, {
+          code: code, key: key, keyCode: keyCode, bubbles: true, cancelable: true
+        }));
+      }
+
+      // Action Buttons Binding
+      const bindButton = (id, code, key, keyCode) => {
+        const btn = document.getElementById(id);
+        btn.addEventListener('touchstart', (e) => { e.preventDefault(); dispatchKey('keydown', code, key, keyCode); });
+        btn.addEventListener('touchend', (e) => { e.preventDefault(); dispatchKey('keyup', code, key, keyCode); });
+      };
+
+      bindButton('btn-jump', 'Space', ' ', 32);
+      bindButton('btn-enter', 'Enter', 'Enter', 13);
+      bindButton('btn-sprint', 'ShiftLeft', 'Shift', 16);
+      bindButton('btn-action', 'KeyF', 'f', 70);
+
+      // Virtual Joystick (WASD)
+      const joyZone = document.getElementById('joystick-zone');
+      const joyNub = document.getElementById('joystick-nub');
+      let joyCenter = { x: 0, y: 0 };
+      let activeKeys = new Set();
+
+      joyZone.addEventListener('touchstart', (e) => {
+        e.preventDefault();
+        const rect = joyZone.getBoundingClientRect();
+        joyCenter = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+        handleJoyMove(e.touches[0]);
+      });
+
+      joyZone.addEventListener('touchmove', (e) => { e.preventDefault(); handleJoyMove(e.touches[0]); });
+      
+      joyZone.addEventListener('touchend', (e) => {
+        e.preventDefault();
+        joyNub.style.transform = `translate(-50%, -50%)`;
+        ['KeyW', 'KeyA', 'KeyS', 'KeyD'].forEach(k => {
+          if (activeKeys.has(k)) { dispatchKey('keyup', k, '', 0); activeKeys.delete(k); }
+        });
+      });
+
+      function handleJoyMove(touch) {
+        let dx = touch.clientX - joyCenter.x;
+        let dy = touch.clientY - joyCenter.y;
+        const maxDist = 40; 
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        
+        if (dist > maxDist) {
+          dx = (dx / dist) * maxDist;
+          dy = (dy / dist) * maxDist;
+        }
+        
+        joyNub.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+
+        // Map angle/threshold to WASD
+        const threshold = 15;
+        const keysToPress = new Set();
+        if (dy < -threshold) keysToPress.add('KeyW');
+        if (dy > threshold) keysToPress.add('KeyS');
+        if (dx < -threshold) keysToPress.add('KeyA');
+        if (dx > threshold) keysToPress.add('KeyD');
+
+        // Diff keys to send down/up events
+        ['KeyW', 'KeyA', 'KeyS', 'KeyD'].forEach(k => {
+          if (keysToPress.has(k) && !activeKeys.has(k)) { dispatchKey('keydown', k, '', 0); activeKeys.add(k); }
+          else if (!keysToPress.has(k) && activeKeys.has(k)) { dispatchKey('keyup', k, '', 0); activeKeys.delete(k); }
+        });
+      }
+
+      // Camera Swipe Logic (Simulates MouseDelta in pointer-lock)
+      const camZone = document.getElementById('camera-zone');
+      let lastTouch = null;
+      camZone.addEventListener('touchstart', (e) => { e.preventDefault(); lastTouch = e.touches[0]; });
+      camZone.addEventListener('touchmove', (e) => {
+        e.preventDefault();
+        const touch = e.touches[0];
+        const movementX = touch.clientX - lastTouch.clientX;
+        const movementY = touch.clientY - lastTouch.clientY;
+        
+        // Dispatch synthetic mousemove with movementX/Y for the engine's look script
+        const canvas = document.getElementById('canvas');
+        const mouseEvent = new MouseEvent('mousemove', {
+          bubbles: true, cancelable: true, clientX: touch.clientX, clientY: touch.clientY, movementX: movementX, movementY: movementY
+        });
+        canvas.dispatchEvent(mouseEvent);
+        lastTouch = touch;
+      });
+      camZone.addEventListener('touchend', (e) => { lastTouch = null; });
+    }
+
+    // PWA Fullscreen Request
+    function toggleFullScreen() {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(err => {
+          console.log(`Error attempting to enable fullscreen: ${err.message}`);
+        });
+        document.getElementById('fs-btn').style.display = 'none';
+      }
+    }
+  </script>
+
+  <!-- Load the main engine JS (The worker rewrites this path relative if needed) -->
+  <script src="game_engine.js"></script>
+</body>
+</html>
