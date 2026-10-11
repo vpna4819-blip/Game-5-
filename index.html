@@ -2,7 +2,6 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <!-- PWA & Mobile Viewport Constraints -->
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -11,7 +10,7 @@
 
   <style>
     body, html { margin: 0; padding: 0; width: 100vw; height: 100vh; background-color: #000; overflow: hidden; touch-action: none; }
-    canvas#canvas { width: 100%; height: 100%; display: block; image-rendering: pixelated; /* Keeps downscaled canvas sharp */ }
+    canvas#canvas { width: 100%; height: 100%; display: block; image-rendering: pixelated; }
     
     /* Touch UI Overlay */
     #touch-ui { display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 9999; pointer-events: none; user-select: none; }
@@ -54,21 +53,16 @@
     // ------------------------------------------------------------------
     const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
     
-    // Default hardware values if API is restricted
     const ram = navigator.deviceMemory || 4; 
     const cores = navigator.hardwareConcurrency || 4;
     
-    // Determine Hardware Tier
+    // Determine Hardware Tier for OOM prevention
     const isLowEnd = isMobile && (ram <= 4 || cores <= 4);
-    
-    // Set dynamic baseline constraints
     let currentScale = isMobile ? (isLowEnd ? 0.5 : 0.7) : 1.0;
     const targetFPS = isMobile ? (isLowEnd ? 30 : 60) : 60;
 
-    // Apply strict worker clamp for mobile
-    if (isMobile) {
-      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => Math.min(cores, 2) });
-    }
+    // Notice: navigator.hardwareConcurrency clamping was REMOVED here. 
+    // Allowing the browser to freely allocate threads fixes the 78% loading pthread deadlock.
 
     // ------------------------------------------------------------------
     // 2. WEBGL INTERCEPTOR (Forced Optimizations)
@@ -78,15 +72,13 @@
       if (options === undefined) options = {};
       
       if (type === 'webgl' || type === 'webgl2') {
-        // Universal high-performance overrides
         options.powerPreference = 'high-performance';
         options.desynchronized = true;
         options.antialias = false; 
         
-        // Aggressive low-end overrides
         if (isLowEnd) {
           options.alpha = false;
-          options.depth = false; // Disables depth-precision buffer per requirements
+          options.depth = false; 
           options.stencil = false;
         }
       }
@@ -94,7 +86,7 @@
     };
 
     // ------------------------------------------------------------------
-    // 3. ENGINE CONFIGURATION (Emscripten / WebAssembly hooks)
+    // 3. ENGINE CONFIGURATION (Emscripten hooks + instantiateStreaming)
     // ------------------------------------------------------------------
     window.Module = {
       canvas: document.getElementById('canvas'),
@@ -105,11 +97,29 @@
         `-lodScale=${isLowEnd ? '0.5' : '0.8'}`
       ] : [],
       preRun: [function() {
-        if (isMobile) {
-          // Set initial hardware-based canvas resolution scale
-          window.devicePixelRatio = currentScale;
-        }
-      }]
+        if (isMobile) window.devicePixelRatio = currentScale;
+      }],
+      // Enforce parallel WebAssembly streaming compilation during download
+      instantiateWasm: function(imports, successCallback) {
+        // Resolve the exact binary file name depending on the upstream engine setup
+        const wasmUrl = (typeof Module.locateFile === 'function') 
+          ? Module.locateFile('game_engine.wasm') 
+          : (Module.wasmBinaryFile || 'game_engine.wasm');
+
+        WebAssembly.instantiateStreaming(fetch(wasmUrl), imports)
+          .then(function(output) {
+            successCallback(output.instance);
+          })
+          .catch(function(err) {
+            console.warn("[WASM] Streaming compilation failed, falling back to ArrayBuffer...", err);
+            fetch(wasmUrl)
+              .then(res => res.arrayBuffer())
+              .then(buf => WebAssembly.instantiate(buf, imports))
+              .then(output => successCallback(output.instance))
+              .catch(fallbackErr => console.error("[WASM] Fallback failed:", fallbackErr));
+          });
+        return {}; // Tell the engine loader to wait asynchronously
+      }
     };
 
     // ------------------------------------------------------------------
@@ -118,7 +128,7 @@
     if (isMobile) {
       let frameCount = 0;
       let lastCheckTime = performance.now();
-      const checkIntervalMs = 3000; // 3 seconds
+      const checkIntervalMs = 3000; 
       
       function monitorDynamicPerformance() {
         frameCount++;
@@ -128,15 +138,11 @@
         if (elapsed >= checkIntervalMs) {
           const avgFps = (frameCount / elapsed) * 1000;
           
-          // If lagging heavily over 3 seconds, drop resolution by 10%
           if (avgFps < 24 && currentScale > 0.2) {
-            currentScale = Math.max(currentScale * 0.90, 0.2); // Don't scale below 20%
-            
-            // Apply new scale and trigger engine window resize
+            currentScale = Math.max(currentScale * 0.90, 0.2); 
             window.devicePixelRatio = currentScale;
             window.dispatchEvent(new Event('resize'));
-            
-            console.warn(`[Auto-Optimization] Thermal throttle/Lag detected. FPS: ${avgFps.toFixed(1)}. Downscaling canvas by 10%. New Scale: ${currentScale.toFixed(2)}x`);
+            console.warn(`[Auto-Optimization] Dropped to ${avgFps.toFixed(1)} FPS. Downscaling canvas to ${currentScale.toFixed(2)}x`);
           }
           
           frameCount = 0;
@@ -144,8 +150,6 @@
         }
         requestAnimationFrame(monitorDynamicPerformance);
       }
-      
-      // Start the performance loop
       requestAnimationFrame(monitorDynamicPerformance);
     }
 
@@ -155,14 +159,10 @@
     if (isMobile) {
       document.getElementById('touch-ui').style.display = 'block';
 
-      // Synthetic Event Dispatcher for WASM engines
       function dispatchKey(type, code, key, keyCode) {
-        window.dispatchEvent(new KeyboardEvent(type, {
-          code: code, key: key, keyCode: keyCode, bubbles: true, cancelable: true
-        }));
+        window.dispatchEvent(new KeyboardEvent(type, { code: code, key: key, keyCode: keyCode, bubbles: true, cancelable: true }));
       }
 
-      // Action Buttons Binding
       const bindButton = (id, code, key, keyCode) => {
         const btn = document.getElementById(id);
         btn.addEventListener('touchstart', (e) => { e.preventDefault(); dispatchKey('keydown', code, key, keyCode); });
@@ -174,7 +174,6 @@
       bindButton('btn-sprint', 'ShiftLeft', 'Shift', 16);
       bindButton('btn-action', 'KeyF', 'f', 70);
 
-      // Virtual Joystick (WASD)
       const joyZone = document.getElementById('joystick-zone');
       const joyNub = document.getElementById('joystick-nub');
       let joyCenter = { x: 0, y: 0 };
@@ -203,14 +202,9 @@
         const maxDist = 40; 
         const dist = Math.sqrt(dx*dx + dy*dy);
         
-        if (dist > maxDist) {
-          dx = (dx / dist) * maxDist;
-          dy = (dy / dist) * maxDist;
-        }
-        
+        if (dist > maxDist) { dx = (dx / dist) * maxDist; dy = (dy / dist) * maxDist; }
         joyNub.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
 
-        // Map angle/threshold to WASD
         const threshold = 15;
         const keysToPress = new Set();
         if (dy < -threshold) keysToPress.add('KeyW');
@@ -218,14 +212,12 @@
         if (dx < -threshold) keysToPress.add('KeyA');
         if (dx > threshold) keysToPress.add('KeyD');
 
-        // Diff keys to send down/up events
         ['KeyW', 'KeyA', 'KeyS', 'KeyD'].forEach(k => {
           if (keysToPress.has(k) && !activeKeys.has(k)) { dispatchKey('keydown', k, '', 0); activeKeys.add(k); }
           else if (!keysToPress.has(k) && activeKeys.has(k)) { dispatchKey('keyup', k, '', 0); activeKeys.delete(k); }
         });
       }
 
-      // Camera Swipe Logic (Simulates MouseDelta in pointer-lock)
       const camZone = document.getElementById('camera-zone');
       let lastTouch = null;
       camZone.addEventListener('touchstart', (e) => { e.preventDefault(); lastTouch = e.touches[0]; });
@@ -235,7 +227,6 @@
         const movementX = touch.clientX - lastTouch.clientX;
         const movementY = touch.clientY - lastTouch.clientY;
         
-        // Dispatch synthetic mousemove with movementX/Y for the engine's look script
         const canvas = document.getElementById('canvas');
         const mouseEvent = new MouseEvent('mousemove', {
           bubbles: true, cancelable: true, clientX: touch.clientX, clientY: touch.clientY, movementX: movementX, movementY: movementY
@@ -243,21 +234,19 @@
         canvas.dispatchEvent(mouseEvent);
         lastTouch = touch;
       });
-      camZone.addEventListener('touchend', (e) => { lastTouch = null; });
+      camZone.addEventListener('touchend', () => { lastTouch = null; });
     }
 
-    // PWA Fullscreen Request
     function toggleFullScreen() {
       if (!document.fullscreenElement) {
         document.documentElement.requestFullscreen().catch(err => {
-          console.log(`Error attempting to enable fullscreen: ${err.message}`);
+          console.log(`Fullscreen error: ${err.message}`);
         });
         document.getElementById('fs-btn').style.display = 'none';
       }
     }
   </script>
 
-  <!-- Load the main engine JS (The worker rewrites this path relative if needed) -->
   <script src="game_engine.js"></script>
 </body>
 </html>
