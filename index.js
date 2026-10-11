@@ -1,6 +1,6 @@
 /**
- * Cloudflare Worker: WebAssembly Game Edge Proxy & Cache API
- * FREE TIER - No R2 Storage Required
+ * Cloudflare Worker: WebAssembly Game Edge Proxy
+ * Features: Chunked Streaming, Accept-Ranges, COOP/COEP Isolation, Cache API
  */
 
 export default {
@@ -9,20 +9,18 @@ export default {
     const originHost = 'gta.deloskiyt.pl';
     const isGet = request.method === 'GET';
     
-    // The Cache API requires a Request object as the key
     const cache = caches.default;
     const cacheKey = new Request(url.toString(), request);
 
-    // 1. CACHE FIRST: Check Cloudflare's free Edge Cache
+    // 1. Edge Cache Check
     if (isGet) {
       const cachedResponse = await cache.match(cacheKey);
       if (cachedResponse) {
-        // Return immediately if found (already contains COOP/COEP headers)
         return cachedResponse;
       }
     }
 
-    // 2. CACHE MISS: Fetch from Upstream Origin Server
+    // 2. Fetch from Upstream Origin
     const targetUrl = new URL(request.url);
     targetUrl.hostname = originHost;
     targetUrl.protocol = 'https:';
@@ -40,10 +38,11 @@ export default {
       return new Response("Origin Server Offline", { status: 502 });
     }
 
-    // 3. HTML INJECTION & REWRITING
-    const isHtml = response.headers.get('Content-Type')?.includes('text/html');
+    const contentType = response.headers.get('Content-Type') || '';
+    const isHtml = contentType.includes('text/html');
     let modifiedResponse = response;
 
+    // 3. HTML Injection & Rewriting (Only on HTML files)
     if (isHtml) {
       const rewriter = new HTMLRewriter()
         .on('[src]', {
@@ -66,35 +65,39 @@ export default {
       modifiedResponse = rewriter.transform(modifiedResponse);
     }
 
-    // 4. ATTACH SECURITY & CACHE HEADERS
+    // 4. Attach Critical Security & Streaming Headers
     const responseHeaders = new Headers(modifiedResponse.headers);
     
-    // Mandatory SharedArrayBuffer isolation & CORS headers for WebAssembly
+    // Strict Multithreading Isolation
     responseHeaders.set('Access-Control-Allow-Origin', '*');
     responseHeaders.set('Cross-Origin-Opener-Policy', 'same-origin');
     responseHeaders.set('Cross-Origin-Embedder-Policy', 'require-corp');
+    
+    // Ensure chunked streaming support is strictly forwarded
+    responseHeaders.set('Accept-Ranges', 'bytes');
 
-    // Set Cache-Control so the Cloudflare Cache API knows how long to store it
+    // Force strict WASM MIME type to trigger browser native instantiateStreaming
+    if (url.pathname.endsWith('.wasm')) {
+      responseHeaders.set('Content-Type', 'application/wasm');
+    }
+
     if (isGet && response.status === 200) {
       if (isHtml) {
-        // HTML gets a shorter cache (1 hour) to allow for frontend updates
         responseHeaders.set('Cache-Control', 'public, max-age=3600');
       } else {
-        // Game assets (.wasm, .js, .data, textures) cached for 1 year
         responseHeaders.set('Cache-Control', 'public, max-age=31536000, immutable');
       }
     }
 
-    // Construct the final response to send to the user and the cache
+    // 5. Stream Body directly to client without buffering in Worker memory
     const finalResponse = new Response(modifiedResponse.body, {
       status: response.status,
       statusText: response.statusText,
       headers: responseHeaders
     });
 
-    // 5. ASYNC CACHING: Store the successful response in the Edge Cache
-    if (isGet && response.status === 200) {
-      // ctx.waitUntil ensures caching finishes in the background without delaying the user
+    // 6. Cache the clone asynchronously 
+    if (isGet && (response.status === 200 || response.status === 206)) {
       ctx.waitUntil(cache.put(cacheKey, finalResponse.clone()));
     }
 
